@@ -193,10 +193,11 @@ class CtxBody(BaseModel):
 
 
 import json
+from fastapi import HTTPException
 
 MAX_CONTEXT_BYTES = 500 * 1024
 
-from fastapi import FastAPI, HTTPException
+
 @app.post("/v1/context")
 def context(body: CtxBody):
     payload_size = len(
@@ -208,14 +209,27 @@ def context(body: CtxBody):
             status_code=413,
             detail="Context payload exceeds 500 KB limit"
         )
-def push_context(body: CtxBody):
+
     key = (body.scope, body.context_id)
     cur = contexts.get(key)
+
     if cur and cur["version"] >= body.version:
-        return {"accepted": False, "reason": "stale_version", "current_version": cur["version"]}
-    contexts[key] = {"version": body.version, "payload": body.payload}
-    return {"accepted": True, "ack_id": f"ack_{body.context_id}_v{body.version}",
-            "stored_at": datetime.utcnow().isoformat() + "Z"}
+        return {
+            "accepted": False,
+            "reason": "stale_version",
+            "current_version": cur["version"],
+        }
+
+    contexts[key] = {
+        "version": body.version,
+        "payload": body.payload,
+    }
+
+    return {
+        "accepted": True,
+        "ack_id": f"ack_{body.context_id}_v{body.version}",
+        "stored_at": datetime.utcnow().isoformat() + "Z",
+    }
 
 
 class TickBody(BaseModel):
@@ -223,7 +237,6 @@ class TickBody(BaseModel):
     available_triggers: list[str] = []
 
 
-@app.post("/v1/tick")
 @app.post("/v1/tick")
 def tick(body: TickBody):
     actions = []
