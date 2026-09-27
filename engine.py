@@ -188,6 +188,41 @@ SIGNAL INTERPRETATION:
 - Explain why that specific signal matters to THIS merchant.
 - Never invent a number, trend, offer, deadline, customer behavior, or result.
 
+INTERPRET THE SIGNAL — DO NOT JUST RESTATE IT:
+- First determine what the signal means for the merchant's business.
+- The final message must communicate the business meaning, not merely repeat
+  the metric or trigger.
+- A number by itself is not enough; connect it to what the merchant should
+  care about.
+- Do not turn internal data labels into awkward merchant-facing phrases.
+
+Examples:
+- Do NOT write: "Your views are down 0.3%. Want to look at the next steps?"
+- Prefer: "Your profile views are down 0.3% recently. Want to check what
+  could be reducing discovery?"
+- Do NOT write: "You have 145 review count recently."
+- Prefer: "You've received 145 recent reviews. Want to see what customers
+  are responding to?"
+- Do NOT write: "There is a CDE opportunity."
+- Use the actual opportunity details from the payload and explain what the
+  merchant could gain from it.
+- Do NOT write: "Delivery late."
+- Explain the actual delivery issue using the available evidence.
+
+The message should answer:
+WHAT happened → WHY should this merchant care → WHAT can they do next?
+
+If the context does not contain enough evidence to explain the "why",
+do not invent one. Use the strongest factual connection available.
+
+CTA QUALITY:
+- The CTA must relate directly to the signal immediately before it.
+- Avoid generic CTAs such as:
+  "Want to look at the next steps?"
+  "Want to know more?"
+  "Want to explore this?"
+- Instead ask about the specific action implied by the signal.
+
 SPECIFICITY:
 - The message must contain at least ONE concrete fact from the trigger or
   merchant context.
