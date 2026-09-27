@@ -12,3 +12,10 @@ wheels/
 .env
 
 src/
+
+.vercel
+
+dataset/
+examples/
+expanded/
+judge_simulator.py

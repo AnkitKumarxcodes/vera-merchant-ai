@@ -12,6 +12,7 @@ This module is independent of the FastAPI endpoint layer.
 import json
 import os
 import re
+import threading
 import time
 from typing import Optional
 from urllib import request as urlreq
@@ -24,7 +25,22 @@ LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "6"))
+LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "10"))
+
+# Free-tier Gemini quotas are tight — a burst of concurrent calls trips 429s
+# even well under the per-minute cap. Serialize calls with a minimum gap
+# instead of firing them all at once; tune via LLM_MIN_INTERVAL if needed.
+_LLM_MIN_INTERVAL = float(os.environ.get("LLM_MIN_INTERVAL", "1.2"))
+_rate_lock = threading.Lock()
+_last_call_at = [0.0]
+
+
+def _throttle():
+    with _rate_lock:
+        wait = _last_call_at[0] + _LLM_MIN_INTERVAL - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _last_call_at[0] = time.time()
 
 
 def llm_complete(system: str, user: str) -> str:
@@ -63,7 +79,11 @@ def llm_complete(system: str, user: str) -> str:
         with urlreq.urlopen(req, timeout=LLM_TIMEOUT) as r:
             return json.loads(r.read())["choices"][0]["message"]["content"]
     elif LLM_PROVIDER == "gemini":
-        model = LLM_MODEL or "gemini-3.8-flash"
+        # "gemini-3.8-flash" does not exist as a model — every call to it
+        # fails immediately, which is why every message in your last run
+        # came from deterministic_fallback. "gemini-flash-latest" is
+        # Google's maintained alias for the current GA flash model.
+        model = LLM_MODEL or "gemini-flash-latest"
 
         body = json.dumps({
             "model": model,
@@ -98,6 +118,26 @@ def _extract_json(text: str) -> dict:
     match = re.search(r"\{[\s\S]*\}", text)
     return json.loads(match.group()) if match else {}
 
+
+def llm_complete_with_retry(system: str, user: str, retries: int = 1) -> str:
+    """Throttled + retried completion. One retry on transient failures
+    (rate limits, timeouts, 5xx); non-transient errors (bad model name, bad
+    key, malformed request) raise immediately since retrying wastes budget."""
+    last_err: Exception = ValueError("no attempt made")
+    for attempt in range(retries + 1):
+        _throttle()
+        try:
+            return llm_complete(system, user)
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            is_429 = "429" in msg
+            transient = is_429 or any(s in msg for s in ("timed out", "500", "502", "503"))
+            if attempt < retries and transient:
+                time.sleep(3.0 if is_429 else 0.6 * (attempt + 1))
+                continue
+            raise last_err
+
 # --------------------------------------------------------------------------
 # Composer — the 4-context → message engine
 # --------------------------------------------------------------------------
@@ -106,6 +146,19 @@ COMPOSER_SYSTEM = """
 You are Vera, magicpin's merchant-growth WhatsApp assistant.
 
 Compose ONE short, natural WhatsApp message using the supplied context.
+
+For every trigger, reason internally in this order:
+
+1. What happened?
+2. What exact evidence supports it?
+3. Why does it matter to this merchant?
+4. What is the smallest useful action the merchant can take?
+5. Write the message.
+
+Never expose this reasoning.
+
+Do not use a trigger's "kind", field name, or internal label as the main
+content of the message. Use the underlying payload/evidence instead.
 
 PRIORITY:
 1. Continue the current conversation if a recent merchant/customer message exists.
@@ -123,6 +176,52 @@ STRICT RULES:
 - Match the category's voice.
 - If customer context exists, write to the CUSTOMER and use send_as="merchant_on_behalf".
 - Otherwise write to the MERCHANT and use send_as="vera".
+
+SIGNAL INTERPRETATION:
+- Identify the single most actionable signal in the trigger.
+- Never copy internal field names such as "views", "calls", "review count",
+  "renewal", "regulation", "opportunity", "cde", etc. as if they were
+  meaningful merchant-facing language.
+- Translate the signal into plain language.
+- If a concrete number, percentage, date, count, trend, named service,
+  offer, or deadline is present, use it accurately.
+- Explain why that specific signal matters to THIS merchant.
+- Never invent a number, trend, offer, deadline, customer behavior, or result.
+
+SPECIFICITY:
+- The message must contain at least ONE concrete fact from the trigger or
+  merchant context.
+- Prefer exact values over vague statements.
+- Prefer "your 1,240 profile views" over "your profile is getting attention".
+- Prefer "your renewal is due on 12 Oct" over "your renewal is coming up".
+- If no useful exact value exists, use the most specific factual detail available.
+- Do not manufacture specificity.
+
+MERCHANT FIT:
+- Use the actual merchant name naturally.
+- Use locality, service, performance, offer, or other merchant details when
+  they materially improve the message.
+- Do not merely insert the merchant name into a generic sentence.
+
+CATEGORY FIT:
+- Make the message naturally appropriate for the merchant's category.
+- Use category-specific concepts only when supported by the supplied context.
+- Dentist, gym, salon, restaurant, and pharmacy messages should not sound
+  interchangeable.
+
+ENGAGEMENT:
+- Give the merchant ONE concrete reason to care now.
+- Ask for ONE low-friction next action.
+- Prefer a question that makes the next step obvious.
+- Do not use generic "Want to know more?" when the context allows a more
+  specific question.
+- Avoid multiple CTAs.
+
+MESSAGE FORM:
+[merchant/context-specific opening] + [concrete signal] +
+[why it matters] + [one CTA]
+
+Keep it short enough for WhatsApp.
 
 Return ONLY valid JSON:
 
@@ -222,31 +321,40 @@ def deterministic_fallback(
         or payload.get("last_message")
     )
 
-    # Otherwise extract the most useful human-readable signal.
-    signal = next(
+    # Named, self-explanatory facts (an actual festival/drug/topic/offer
+    # name) are safe to surface as-is.
+    named_fact = next(
         (
             str(payload[key]).replace("_", " ")
             for key in (
-                "headline",
-                "intent_topic",
-                "metric_or_topic",
-                "theme",
-                "festival",
-                "offer",
-                "signal",
-                "metric",
-                "molecule",
-                "competitor_name",
+                "headline", "intent_topic", "metric_or_topic", "theme",
+                "festival", "offer", "molecule", "competitor_name",
             )
             if payload.get(key)
         ),
         None,
     )
 
+    # "metric"/"signal" values are usually bare internal labels ("calls",
+    # "views", "review count") — never surface the label alone. Only use it
+    # once paired with an actual number, otherwise skip it entirely.
+    metric_fact = None
+    metric_label = payload.get("metric") or payload.get("signal")
+    if metric_label:
+        label = str(metric_label).replace("_", " ")
+        delta = payload.get("delta_pct")
+        value_now = payload.get("value_now")
+        if isinstance(delta, (int, float)):
+            metric_fact = f"{label} {'up' if delta >= 0 else 'down'} {abs(delta):g}%"
+        elif value_now not in (None, ""):
+            metric_fact = f"{value_now} {label}"
+
     if conversation:
         body = f"{name} — picking up from your message: “{conversation}” What would you like to do next?"
-    elif signal:
-        body = f"{name} — {signal}. Want to look at the next step?"
+    elif named_fact:
+        body = f"{name} — {named_fact}. Want to look at the next step?"
+    elif metric_fact:
+        body = f"{name} — {metric_fact} recently. Want to look at the next step?"
     else:
         body = f"{name} — there’s a {kind} update relevant to your business. Want to take the next step?"
 
@@ -314,7 +422,7 @@ def compose_message(
     )
 
     try:
-        raw = llm_complete(COMPOSER_SYSTEM, user_prompt)
+        raw = llm_complete_with_retry(COMPOSER_SYSTEM, user_prompt)
         data = _extract_json(raw)
 
         body = (data.get("body") or "").strip()

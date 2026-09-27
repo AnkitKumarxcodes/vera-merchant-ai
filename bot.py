@@ -1,11 +1,5 @@
 """
-engine.py — Vera's message decision and composition engine.
-
-Contains the LLM interface and the logic used to decide whether a
-trigger should produce a message and how that message should be
-composed.
-
-This module is independent of the FastAPI endpoint layer.
+bot.py — FastAPI endpoint layer for Vera.
 """
 import os
 import time
@@ -26,7 +20,7 @@ from engine import (
     compose_message,
     should_send,
     _extract_json,
-    llm_complete,
+    llm_complete_with_retry,
 )
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
@@ -34,18 +28,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "")
-# --------------------------------------------------------------------------
-# LLM call (single deterministic completion, temperature=0)
-# --------------------------------------------------------------------------
-
-
-
-
-def _extract_json(text: str) -> dict:
-    match = re.search(r"\{[\s\S]*\}", text)
-    return json.loads(match.group()) if match else {}
-
-
 # --------------------------------------------------------------------------
 # In-memory state (persists for the life of the process, wiped on /v1/teardown)
 # --------------------------------------------------------------------------
@@ -88,10 +70,6 @@ def handle_reply(conv_id: str, merchant_id: str, message: str) -> dict:
         conv_id, {"merchant_id": merchant_id, "history": [], "sent_bodies": [], "ended": False})
     conv["history"].append({"from": "merchant", "body": message})
 
-    # autoreply strike-counting is merchant-scoped (the judge issues a fresh
-    # conversation_id per turn), but "ended" is conversation-scoped — closing
-    # one conversation must not silence unrelated future conversations with
-    # the same merchant.
     mstate = merchant_state.setdefault(merchant_id, {"msg_counts": Counter(), "autoreply_strikes": 0})
     mstate["msg_counts"][message] += 1
 
@@ -121,7 +99,6 @@ def handle_reply(conv_id: str, merchant_id: str, message: str) -> dict:
         merchant = get_ctx("merchant", merchant_id) or {}
         merchant_name = merchant.get("identity", {}).get("name", "your business")
 
-        # Deterministic path: never call the LLM for an unambiguous affirmative.
         body = (
             f"Perfect, {merchant_name} — let's do it. "
             "I'll take you through the next step and confirm once it's ready."
@@ -140,7 +117,7 @@ def handle_reply(conv_id: str, merchant_id: str, message: str) -> dict:
     merchant = get_ctx("merchant", merchant_id) or {}
     category = get_ctx("category", merchant.get("category_slug", "")) or {}
     try:
-        raw = llm_complete(
+        raw = llm_complete_with_retry(
             COMPOSER_SYSTEM,
             build_user_prompt(category, merchant, {"kind": "conversation_reply", "payload": {"message": message}},
                                None, conv["sent_bodies"]))
@@ -192,7 +169,6 @@ class CtxBody(BaseModel):
     delivered_at: str
 
 
-import json
 from fastapi import HTTPException
 
 MAX_CONTEXT_BYTES = 500 * 1024
@@ -242,7 +218,6 @@ def tick(body: TickBody):
     actions = []
     candidates = []
 
-    # Collect at most 20 actionable triggers.
     for trg_id in body.available_triggers:
         if len(candidates) >= 20:
             break
@@ -286,7 +261,6 @@ def tick(body: TickBody):
             (trg_id, trigger, merchant_id, merchant, customer_id, customer)
         )
 
-    # Compose messages in parallel so /v1/tick stays well below 30s.
     def compose_candidate(item):
         trg_id, trigger, merchant_id, merchant, customer_id, customer = item
 
@@ -309,12 +283,14 @@ def tick(body: TickBody):
             composed,
         )
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    # Gemini free-tier quotas trip on bursts even under the per-minute cap;
+    # engine._throttle() already serializes actual calls with a minimum gap,
+    # so a small worker count here just keeps requests queued cleanly.
+    with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(
             executor.map(compose_candidate, candidates)
         )
 
-    # Build API response in original trigger order.
     for (
         trg_id,
         trigger,
